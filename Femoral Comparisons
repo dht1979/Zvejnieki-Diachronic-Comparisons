@@ -1,0 +1,247 @@
+## ============================================================
+## MALE FEMORA — Pairwise Bayesian Models (brms)
+## Kunda–Narva and Narva–Neolithic
+## Headers EXACTLY: Period  TA  CA  MA  Ix  Iy  J  IxIy
+##
+## DATA-SCALED PRIORS:
+##   Intercept ~ Normal(y_mean, 5*y_sd)
+##   group b   ~ Normal(0,      5*y_sd)
+##
+## Output:
+##   - ONE PNG (LONG HORIZONTAL, facets ordered TA CA MA Ix Iy J IxIy)
+##   - Summary CSV (means, 95% CIs, CI overlap %)
+## ============================================================
+
+library(brms)
+library(dplyr)
+library(readr)
+library(ggplot2)
+library(tidyr)
+
+options(mc.cores = parallel::detectCores())
+
+## ------------------------------------------------------------
+## PATHS
+## ------------------------------------------------------------
+base_dir  <- "C:/Users/dtemple3/OneDrive - George Mason University - O365 Production/Desktop/Baikal Presentation/Documents"
+file_path <- file.path(base_dir, "Male Femora Time.csv")
+stopifnot(file.exists(file_path))
+message("Using file:\n  ", file_path)
+
+out_dir <- file.path(base_dir, "MaleFemora_Bayes_PeriodPosteriors")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+timestamp <- format(Sys.time(), "%Y%m%d_%H%M%S")
+
+## ------------------------------------------------------------
+## SETTINGS
+## ------------------------------------------------------------
+iter   <- 3000
+chains <- 4
+seed   <- 123
+
+## LONG HORIZONTAL OUTPUT (single row of 7 facets)
+width_in  <- 16.0
+height_in <- 3.6
+dpi <- 600
+
+## ------------------------------------------------------------
+## LOAD
+## ------------------------------------------------------------
+dat0 <- read_csv(file_path, show_col_types = FALSE)
+names(dat0) <- trimws(names(dat0))
+
+req <- c("Period","TA","CA","MA","Ix","Iy","J","IxIy")
+miss <- setdiff(req, names(dat0))
+if(length(miss) > 0) stop("Missing columns: ", paste(miss, collapse=", "),
+                          "\nColumns are:\n", paste(names(dat0), collapse=", "))
+
+dat <- dat0 %>%
+  transmute(
+    period = tolower(trimws(as.character(Period))),
+    TA   = as.numeric(TA),
+    CA   = as.numeric(CA),
+    MA   = as.numeric(MA),
+    Ix   = as.numeric(Ix),
+    Iy   = as.numeric(Iy),
+    J    = as.numeric(J),
+    IxIy = as.numeric(IxIy)
+  ) %>%
+  filter(period %in% c("kunda","narva","neolithic"))
+
+## ORDER REQUESTED
+vars <- c("TA","CA","MA","Ix","Iy","J","IxIy")
+
+## ------------------------------------------------------------
+## Helpers
+## ------------------------------------------------------------
+ci_overlap_prop <- function(lo1, hi1, lo2, hi2){
+  overlap <- max(0, min(hi1, hi2) - max(lo1, lo2))
+  w1 <- hi1 - lo1
+  w2 <- hi2 - lo2
+  den <- min(w1, w2)
+  if(is.finite(den) && den > 0) overlap/den else NA_real_
+}
+
+pretty_var <- function(v){
+  if(v == "IxIy") "IxIy" else v
+}
+
+## Fit 2-group model with data-scaled priors (numeric constants!)
+fit_pair <- function(d, ref_levels){
+  d$group <- factor(d$group, levels = ref_levels)
+  if(any(table(d$group) < 3)) return(NULL)
+
+  y_mean <- mean(d$value, na.rm = TRUE)
+  y_sd   <- sd(d$value, na.rm = TRUE)
+  if(!is.finite(y_sd) || y_sd == 0) y_sd <- 1
+
+  int_sd <- 5 * y_sd
+  b_sd   <- 5 * y_sd
+
+  pri <- c(
+    prior_string(paste0("normal(", signif(y_mean, 8), ", ", signif(int_sd, 8), ")"),
+                 class = "Intercept"),
+    prior_string(paste0("normal(0, ", signif(b_sd, 8), ")"),
+                 class = "b"),
+    prior(exponential(1), class = "sigma")
+  )
+
+  fit <- brm(
+    value ~ group,
+    data = d,
+    family = gaussian(),
+    prior = pri,
+    iter = iter,
+    chains = chains,
+    seed = seed,
+    refresh = 100
+  )
+
+  post <- as_draws_df(fit)
+  b0 <- post$b_Intercept
+  coef <- grep("^b_group", names(post), value = TRUE)[1]
+
+  list(
+    mu_ref   = b0,
+    mu_other = b0 + post[[coef]],
+    n = table(d$group)
+  )
+}
+
+## ------------------------------------------------------------
+## MAIN
+## ------------------------------------------------------------
+dens_all <- list()
+summ_all <- list()
+
+for(v in vars){
+
+  dvar <- dat %>%
+    transmute(group = period, value = .data[[v]]) %>%
+    filter(is.finite(value))
+
+  d_kn   <- dvar %>% filter(group %in% c("kunda","narva"))
+  d_nneo <- dvar %>% filter(group %in% c("narva","neolithic"))
+
+  out_kn   <- fit_pair(d_kn,   c("narva","kunda"))
+  out_nneo <- fit_pair(d_nneo, c("narva","neolithic"))
+
+  if(is.null(out_kn) | is.null(out_nneo)){
+    message("Skipping ", v, " (need ≥3 obs per group for both fits).")
+    next
+  }
+
+  mu_narva <- out_kn$mu_ref
+  mu_kunda <- out_kn$mu_other
+  mu_neo   <- out_nneo$mu_other
+
+  k_ci   <- unname(quantile(mu_kunda, c(.025,.975)))
+  n_ci   <- unname(quantile(mu_narva, c(.025,.975)))
+  neo_ci <- unname(quantile(mu_neo,   c(.025,.975)))
+
+  ov_kn_prop   <- ci_overlap_prop(k_ci[1], k_ci[2], n_ci[1], n_ci[2])
+  ov_nneo_prop <- ci_overlap_prop(n_ci[1], n_ci[2], neo_ci[1], neo_ci[2])
+
+  summ_all[[v]] <- tibble(
+    Variable = v,
+
+    kunda_mean = mean(mu_kunda),
+    narva_mean = mean(mu_narva),
+    neo_mean   = mean(mu_neo),
+
+    kunda_lo95 = k_ci[1],
+    kunda_hi95 = k_ci[2],
+    narva_lo95 = n_ci[1],
+    narva_hi95 = n_ci[2],
+    neo_lo95   = neo_ci[1],
+    neo_hi95   = neo_ci[2],
+
+    ci_overlap_prop_KN   = ov_kn_prop,
+    ci_overlap_pct_KN    = 100 * ov_kn_prop,
+    ci_overlap_prop_NNeo = ov_nneo_prop,
+    ci_overlap_pct_NNeo  = 100 * ov_nneo_prop,
+
+    n_kunda = unname(out_kn$n["kunda"]),
+    n_narva = unname(out_kn$n["narva"]),
+    n_neo   = unname(out_nneo$n["neolithic"])
+  )
+
+  dens_all[[v]] <- bind_rows(
+    tibble(Variable = v, period="kunda",     mu=mu_kunda),
+    tibble(Variable = v, period="narva",     mu=mu_narva),
+    tibble(Variable = v, period="neolithic", mu=mu_neo)
+  )
+}
+
+summary_tbl <- bind_rows(summ_all)
+dens <- bind_rows(dens_all)
+
+if(nrow(summary_tbl) == 0 || nrow(dens) == 0){
+  stop("No variables were successfully fit (likely due to low n per group). Check counts per period.")
+}
+
+## ------------------------------------------------------------
+## ORDER FACETS + WRITE CSV
+## ------------------------------------------------------------
+facet_order <- c("TA","CA","MA","Ix","Iy","J","IxIy")
+
+dens <- dens %>%
+  mutate(
+    period   = factor(period, levels = c("kunda","narva","neolithic")),
+    Variable = factor(Variable, levels = facet_order)
+  ) %>%
+  filter(!is.na(Variable))
+
+summary_tbl <- summary_tbl %>%
+  mutate(Variable = factor(Variable, levels = facet_order)) %>%
+  arrange(Variable)
+
+out_csv <- file.path(out_dir, paste0("MaleFemora_PeriodPosterior_Summary_", timestamp, ".csv"))
+write_csv(summary_tbl, out_csv)
+
+## ------------------------------------------------------------
+## PLOT (ONE LONG HORIZONTAL ROW)
+## ------------------------------------------------------------
+p <- ggplot(dens, aes(mu, fill=period, color=period)) +
+  geom_density(alpha=.25, linewidth=1.0, adjust=1.1) +
+  facet_wrap(~Variable, scales="free", ncol=7) +
+  theme_minimal(base_size=12) +
+  labs(
+    title = "Male femur: posterior period means (pairwise Bayesian models)",
+    subtitle = "Facets ordered: TA, CA, MA, Ix, Iy, J, IxIy",
+    x = "Posterior mean (by period)",
+    y = "Density",
+    fill = NULL,
+    color = NULL
+  ) +
+  theme(
+    legend.position = "top",
+    strip.text = element_text(face="bold"),
+    plot.title = element_text(face="bold"),
+    panel.grid.minor = element_blank()
+  )
+
+png_file <- file.path(out_dir, paste0("MaleFemora_PeriodPosteriors_LONGHORIZ_", timestamp, ".png"))
+ggsave(png_file, p, width = width_in, height = height_in, dpi = dpi)
+
+cat("\nSaved:\n", out_csv, "\n", png_file, "\n")
