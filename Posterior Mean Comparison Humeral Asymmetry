@@ -1,10 +1,9 @@
 ## ============================================================
-## 3-GROUP BAYESIAN POSTERIORS FOR HUMERAL ASYMMETRY
-## Kunda vs Narva vs Neolithic
-## Includes:
-##   - CI overlap
-##   - P(|μA−μB| ≤ δ)
-##   - P(|μA−μB| > δ)
+## PAIRWISE MODELS, ONE GRAPH (3 curves)
+## - Fit Kunda vs Narva separately
+## - Fit Narva vs Neolithic separately
+## - Plot Kunda/Narva/Neolithic posteriors together
+## - Output BOTH: CI overlap + P(|Δμ|<=δ) (and complement)
 ## ============================================================
 
 library(brms)
@@ -17,22 +16,18 @@ library(tidyr)
 options(mc.cores = parallel::detectCores())
 
 ## ------------------------------------------------------------
-## PATHS  (your usual folder)
+## PATHS
 ## ------------------------------------------------------------
-base_dir <- "Whatever you use"
+base_dir <- "C:/Users/dtemple3/OneDrive - George Mason University - O365 Production/Desktop/Baikal Presentation/Documents"
 stem <- "Zvejnieki Asymmetry Time"
 
 hits <- list.files(base_dir, pattern = stem, ignore.case = TRUE, full.names = TRUE)
-
-if(length(hits)==0){
-  stop("File not found. Check filename inside:\n", base_dir)
-}
-
+if(length(hits)==0) stop("File not found in: ", base_dir)
 file_path <- hits[1]
 message("Using file:\n  ", file_path)
 
-out_dir <- file.path(base_dir, "ThreeWay_Bayes")
-if(!dir.exists(out_dir)) dir.create(out_dir)
+out_dir <- file.path(base_dir, "PairwiseOnOneGraph_Bayes")
+if(!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
 
 ## ------------------------------------------------------------
 ## SETTINGS
@@ -40,29 +35,32 @@ if(!dir.exists(out_dir)) dir.create(out_dir)
 iter   <- 3000
 chains <- 4
 seed   <- 123
-delta  <- 0.10   # functional difference threshold
 
-groups <- c("kunda","narva","neolithic")
+delta <- 0.10   # IMPORTANT: must match variable scale
+width_in  <- 7.25
+height_in <- 10.5
+dpi <- 600
+ncol_facets <- 2
 
 ## ------------------------------------------------------------
-## LOAD
+## LOAD + GROUP COLUMN
 ## ------------------------------------------------------------
 dat <- read_csv(file_path, show_col_types = FALSE)
 names(dat) <- trimws(names(dat))
 
 group_col <- names(dat)[str_detect(tolower(names(dat)), "group|period|phase|culture|time")][1]
+if (is.na(group_col)) stop("Could not identify group column.")
 
 dat[[group_col]] <- tolower(trimws(dat[[group_col]]))
-dat <- dat %>% filter(.data[[group_col]] %in% groups)
 
-dat_num <- dat %>%
-  mutate(across(-all_of(group_col), ~ suppressWarnings(as.numeric(.x))))
+## numeric variables
+dat_num <- dat %>% mutate(across(-all_of(group_col), ~ suppressWarnings(as.numeric(.x))))
+vars <- dat_num %>% select(-all_of(group_col)) %>% select(where(is.numeric)) %>% names()
+if(length(vars)==0) stop("No numeric variables found.")
 
-vars <- dat_num %>%
-  select(-all_of(group_col)) %>%
-  select(where(is.numeric)) %>%
-  names()
-
+## ------------------------------------------------------------
+## PRIORS (keep yours; widen if you want less shrink)
+## ------------------------------------------------------------
 pri <- c(
   prior(normal(0,10), class="Intercept"),
   prior(normal(0,5), class="b"),
@@ -70,31 +68,22 @@ pri <- c(
 )
 
 ## ------------------------------------------------------------
-## CI overlap function
+## Helpers
 ## ------------------------------------------------------------
 ci_overlap_prop <- function(lo1, hi1, lo2, hi2){
   overlap <- max(0, min(hi1, hi2) - max(lo1, lo2))
   w1 <- hi1 - lo1
   w2 <- hi2 - lo2
   den <- min(w1, w2)
-  if(is.finite(den) && den>0) overlap/den else NA_real_
+  if(is.finite(den) && den > 0) overlap/den else NA_real_
 }
 
-summ_list <- list()
-dens_list <- list()
+fit_2group <- function(d, ref_first){
+  d <- d %>% filter(is.finite(value))
+  d$group <- factor(d$group, levels = ref_first)
 
-## ------------------------------------------------------------
-## LOOP VARIABLES
-## ------------------------------------------------------------
-for(v in vars){
-
-  d <- dat_num %>%
-    select(all_of(group_col), all_of(v)) %>%
-    rename(group = all_of(group_col), value = all_of(v)) %>%
-    filter(is.finite(value)) %>%
-    mutate(group = factor(group, levels = groups))
-
-  if(any(table(d$group) < 3)) next
+  if(length(levels(d$group)) != 2) return(NULL)
+  if(any(table(d$group) < 3)) return(NULL)
 
   fit <- brm(
     value ~ group,
@@ -109,84 +98,117 @@ for(v in vars){
   )
 
   post <- as_draws_df(fit)
-
   b0 <- post$b_Intercept
-  b_nar <- if("b_groupnarva" %in% names(post)) post$b_groupnarva else rep(0,length(b0))
-  b_neo <- if("b_groupneolithic" %in% names(post)) post$b_groupneolithic else rep(0,length(b0))
+  coef_name <- grep("^b_group", names(post), value = TRUE)
+  if(length(coef_name) != 1) stop("Unexpected group coef(s): ", paste(coef_name, collapse=", "))
 
-  muK   <- b0
-  muN   <- b0 + b_nar
-  muNeo <- b0 + b_neo
+  levs <- levels(d$group) # c(ref, other)
+  mu_ref   <- b0
+  mu_other <- b0 + post[[coef_name]]
 
-  ## credible intervals
-  K_lo <- quantile(muK,.025); K_hi <- quantile(muK,.975)
-  N_lo <- quantile(muN,.025); N_hi <- quantile(muN,.975)
-  Neo_lo <- quantile(muNeo,.025); Neo_hi <- quantile(muNeo,.975)
+  list(ref=levs[1], other=levs[2], mu_ref=mu_ref, mu_other=mu_other, n=table(d$group))
+}
 
-  ## CI overlap
-  ov_KN   <- ci_overlap_prop(K_lo,K_hi,N_lo,N_hi)
-  ov_NNeo <- ci_overlap_prop(N_lo,N_hi,Neo_lo,Neo_hi)
+## ------------------------------------------------------------
+## MAIN LOOP
+## ------------------------------------------------------------
+summ_list <- list()
+dens_list <- list()
 
-  ## posterior differences
-  d_KN   <- muK - muN
-  d_NNeo <- muN - muNeo
+for(v in vars){
 
-  p_equiv_KN   <- mean(abs(d_KN) <= delta)
-  p_equiv_NNeo <- mean(abs(d_NNeo) <= delta)
+  base <- dat_num %>%
+    select(all_of(group_col), all_of(v)) %>%
+    rename(group = all_of(group_col), value = all_of(v)) %>%
+    mutate(group = tolower(trimws(group)))
+
+  ## Kunda vs Narva (make Narva the reference so intercept is Narva)
+  d_kn <- base %>% filter(group %in% c("kunda","narva"))
+  out_kn <- fit_2group(d_kn, ref_first = c("narva","kunda"))
+  if(is.null(out_kn)) next
+
+  ## Narva vs Neolithic (Narva reference again)
+  d_nneo <- base %>% filter(group %in% c("narva","neolithic"))
+  out_nneo <- fit_2group(d_nneo, ref_first = c("narva","neolithic"))
+  if(is.null(out_nneo)) next
+
+  ## Use KN posteriors for Kunda and Narva (so KN matches your 2-way plot)
+  mu_narva <- out_kn$mu_ref
+  mu_kunda <- out_kn$mu_other
+
+  ## Use NNeo posterior for Neolithic
+  mu_neo <- out_nneo$mu_other
+
+  ## Pairwise differences (what you asked for)
+  dmu_kn   <- mu_kunda - mu_narva
+  dmu_nneo <- out_nneo$mu_ref - mu_neo   # Narva - Neolithic
+
+  ## 95% CrIs for means (for CI overlap)
+  k_lo <- as.numeric(quantile(mu_kunda, 0.025)); k_hi <- as.numeric(quantile(mu_kunda, 0.975))
+  n_lo <- as.numeric(quantile(mu_narva, 0.025)); n_hi <- as.numeric(quantile(mu_narva, 0.975))
+  neo_lo <- as.numeric(quantile(mu_neo, 0.025)); neo_hi <- as.numeric(quantile(mu_neo, 0.975))
+
+  ov_kn   <- ci_overlap_prop(k_lo, k_hi, n_lo, n_hi)
+  ov_nneo <- ci_overlap_prop(n_lo, n_hi, neo_lo, neo_hi)
+
+  p_equiv_kn   <- mean(abs(dmu_kn) <= delta)
+  p_equiv_nneo <- mean(abs(dmu_nneo) <= delta)
 
   summ_list[[v]] <- tibble(
     variable = v,
 
-    kunda_mean = mean(muK),
-    narva_mean = mean(muN),
-    neolithic_mean = mean(muNeo),
+    kunda_mean = mean(mu_kunda), kunda_lo = k_lo, kunda_hi = k_hi,
+    narva_mean = mean(mu_narva), narva_lo = n_lo, narva_hi = n_hi,
+    neolithic_mean = mean(mu_neo), neolithic_lo = neo_lo, neolithic_hi = neo_hi,
 
-    kunda_lo = K_lo, kunda_hi = K_hi,
-    narva_lo = N_lo, narva_hi = N_hi,
-    neo_lo = Neo_lo, neo_hi = Neo_hi,
+    ## "regular overlap" (95% CrI overlap proportion)
+    ci_overlap_prop_Kunda_Narva = ov_kn,
+    ci_overlap_prop_Narva_Neolithic = ov_nneo,
 
-    ci_overlap_Kunda_Narva = ov_KN,
-    ci_overlap_Narva_Neolithic = ov_NNeo,
+    ## posterior practical-overlap (equivalence)
+    P_absdiff_le_delta_Kunda_Narva = p_equiv_kn,
+    P_diff_gt_delta_Kunda_Narva = 1 - p_equiv_kn,
 
-    P_absdiff_le_delta_KN   = p_equiv_KN,
-    P_absdiff_le_delta_NNeo = p_equiv_NNeo,
-
-    P_diff_gt_delta_KN   = 1 - p_equiv_KN,
-    P_diff_gt_delta_NNeo = 1 - p_equiv_NNeo,
+    P_absdiff_le_delta_Narva_Neolithic = p_equiv_nneo,
+    P_diff_gt_delta_Narva_Neolithic = 1 - p_equiv_nneo,
 
     delta_used = delta,
 
-    n_kunda = sum(d$group=="kunda"),
-    n_narva = sum(d$group=="narva"),
-    n_neo   = sum(d$group=="neolithic")
+    n_kunda = as.integer(out_kn$n["kunda"]),
+    n_narva_KN = as.integer(out_kn$n["narva"]),
+    n_narva_NNeo = as.integer(out_nneo$n["narva"]),
+    n_neolithic = as.integer(out_nneo$n["neolithic"])
   )
 
   dens_list[[v]] <- bind_rows(
-    tibble(variable=v, group="kunda", mu=muK),
-    tibble(variable=v, group="narva", mu=muN),
-    tibble(variable=v, group="neolithic", mu=muNeo)
+    tibble(variable=v, group="kunda", mu=mu_kunda),
+    tibble(variable=v, group="narva", mu=mu_narva),
+    tibble(variable=v, group="neolithic", mu=mu_neo)
   )
 }
 
 summ <- bind_rows(summ_list)
 dens <- bind_rows(dens_list)
 
-## ------------------------------------------------------------
-## PLOT
-## ------------------------------------------------------------
-p <- ggplot(dens, aes(mu, fill=group, color=group)) +
-  geom_density(alpha=.25, linewidth=.6) +
-  facet_wrap(~variable, scales="free") +
-  theme_minimal(base_size=12) +
-  theme(strip.text=element_text(face="bold"))
+if(nrow(summ)==0) stop("No variables passed: need >=3 per group within EACH pair (KN and NNeo).")
 
-timestamp <- format(Sys.time(),"%Y%m%d_%H%M%S")
+dens$group <- factor(dens$group, levels = c("kunda","narva","neolithic"))
 
-png_file <- file.path(out_dir,paste0("ThreeWay_Posteriors_",timestamp,".png"))
-csv_file <- file.path(out_dir,paste0("ThreeWay_Summary_",timestamp,".csv"))
+p <- ggplot(dens, aes(x = mu, fill = group, color = group)) +
+  geom_density(alpha = 0.25, linewidth = 0.6) +
+  facet_wrap(~variable, scales = "free", ncol = ncol_facets) +
+  theme_minimal(base_size = 12) +
+  theme(strip.text = element_text(face="bold"),
+        panel.grid.minor = element_blank(),
+        legend.position = "top") +
+  labs(x="Posterior group mean (mu)", y="Density", fill=NULL, color=NULL)
 
-ggsave(png_file,p,width=7.25,height=10.5,dpi=600)
-write_csv(summ,csv_file)
+timestamp <- format(Sys.time(), "%Y%m%d_%H%M%S")
+png_out <- file.path(out_dir, paste0("PairwiseOnOneGraph_Posteriors_", timestamp, ".png"))
+csv_out <- file.path(out_dir, paste0("PairwiseOnOneGraph_Summary_", timestamp, ".csv"))
 
-cat("\nSaved PNG:\n",png_file,"\n")
-cat("Saved CSV:\n",csv_file,"\n")
+ggsave(png_out, p, width = width_in, height = height_in, dpi = dpi)
+write_csv(summ, csv_out)
+
+cat("\nSaved PNG:\n", png_out, "\n")
+cat("Saved CSV:\n", csv_out, "\n")
